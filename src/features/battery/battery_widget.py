@@ -59,7 +59,7 @@ class ResultDialog(QDialog):
             "font-size: 30px; font-weight: bold; color: #1A6B45;"
         )
 
-        sub_lbl = QLabel("咩~ 电量充足，咩咩羊精力满满！")
+        sub_lbl = QLabel("电量充足，电池健康💚！")
         sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub_lbl.setStyleSheet("font-size: 13px; color: #7CB89C;")
 
@@ -116,7 +116,7 @@ class BatteryWidget(QWidget):
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # 副标题
-        sub_lbl = QLabel("趣味功能 · 点击检测你的电量满不满 🐑")
+        sub_lbl = QLabel("点击检测你的电量满不满 🐑")
         sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub_lbl.setStyleSheet("font-size: 13px; color: #8BAF9B;")
 

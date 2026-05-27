@@ -1,6 +1,6 @@
 """
 高速转发功能模块 —— MQTT 客户端
-支持自定义消息发送 + 预设模版（OTA 升级指令）
+支持自定义消息发送 + 跨平台 OTA 升级（单设备 / Excel 批量）
 """
 import datetime
 import json
@@ -10,39 +10,70 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QTextEdit, QGroupBox,
     QFormLayout, QSpinBox, QFrame, QSizePolicy,
-    QFileDialog,
+    QFileDialog, QStackedWidget, QScrollArea,
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer
 
 CONN_TIMEOUT_MS = 3000  # 连接超时：3 秒
 
-# -------------------------------------------------------------------
-# 模版 1：OTA 升级指令固定 Payload
-# -------------------------------------------------------------------
-TEMPLATE_1_PAYLOAD = json.dumps(
-    {
-        "cmd": "ota",
-        "requestId": "ota_001",
-        "data": {
-            "espfileUrl": (
-                "http://ql-rms.oss-cn-shenzhen.aliyuncs.com/2026-05-25/"
-                "0dbd062998d743d7a5f6962add5ca6f3customer_app.bin"
-            ),
-            "espver": "1.1",
-            "espfilesize": 170000,
-            "espfilesha256": (
-                "3531eeb07bf687955420d6137261c4a095ddefe6f8fef5d3b9df446053a465a0"
-            ),
+
+# ─── OTA payload 构建 ─────────────────────────────────────────────────────────
+def _build_ota_payload(url: str, ver: str, size: int, sha256: str,
+                       pretty: bool = False) -> str:
+    """构建 OTA JSON payload（与原 TEMPLATE_1_PAYLOAD 结构相同）"""
+    return json.dumps(
+        {
+            "cmd": "ota",
+            "requestId": "ota_001",
+            "data": {
+                "espfileUrl":    url,
+                "espver":        ver,
+                "espfilesize":   size,
+                "espfilesha256": sha256,
+            },
         },
-    },
-    ensure_ascii=False,
-    indent=None,
-)
+        ensure_ascii=False,
+        indent=2 if pretty else None,
+    )
 
 
-# -------------------------------------------------------------------
-# MQTT 管理器（连接超时 3 秒 + 发布结果信号）
-# -------------------------------------------------------------------
+# ─── 按钮辅助 ─────────────────────────────────────────────────────────────────
+_BTN_CSS = """
+    QPushButton {{
+        background-color: {c}; color: white; border: none;
+        border-radius: 7px; padding: 3px 14px;
+        font-size: 12px; font-weight: bold;
+    }}
+    QPushButton:hover    {{ background-color: {ch}; }}
+    QPushButton:disabled {{ background-color: {cd}; color: #bbb; }}
+"""
+
+
+def _make_btn(text: str, hex_color: str, height: int = 30) -> QPushButton:
+    btn = QPushButton(text)
+    btn.setFixedHeight(height)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setStyleSheet(_BTN_CSS.format(
+        c=hex_color, ch=hex_color + "CC", cd=hex_color + "55"))
+    return btn
+
+
+def _outline_btn(text: str, color: str, height: int = 24) -> QPushButton:
+    btn = QPushButton(text)
+    btn.setFixedHeight(height)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background-color: transparent; color: {color};
+            border: 1px solid {color}; border-radius: 5px;
+            padding: 1px 8px; font-size: 11px;
+        }}
+        QPushButton:hover {{ background-color: {color}22; }}
+    """)
+    return btn
+
+
+# ─── MQTTManager ──────────────────────────────────────────────────────────────
 class MQTTManager(QObject):
     sig_connected    = Signal()
     sig_disconnected = Signal()
@@ -192,9 +223,7 @@ class MQTTManager(QObject):
         )
 
 
-# -------------------------------------------------------------------
-# Excel 批量管理器
-# -------------------------------------------------------------------
+# ─── ExcelBatchManager ────────────────────────────────────────────────────────
 class ExcelBatchManager:
     """读取 Excel 中 uid 列，发送成功后将对应单元格标绿保存"""
 
@@ -278,43 +307,23 @@ class ExcelBatchManager:
         self._uid_rows = []
 
 
-# -------------------------------------------------------------------
-# 批量执行面板（嵌入在模版区下方）
-# -------------------------------------------------------------------
-_BTN_CSS = """
-    QPushButton {{
-        background-color: {c}; color: white; border: none;
-        border-radius: 7px; padding: 3px 14px;
-        font-size: 12px; font-weight: bold;
-    }}
-    QPushButton:hover   {{ background-color: {ch}; }}
-    QPushButton:disabled {{ background-color: {cd}; color: #bbb; }}
-"""
-
-
-def _make_btn(text: str, hex_color: str) -> QPushButton:
-    """创建统一风格的操作按钮"""
-    import colorsys
-    btn = QPushButton(text)
-    btn.setFixedHeight(30)
-    btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    # 生成 hover / disabled 色（简单深/浅变体）
-    btn.setStyleSheet(_BTN_CSS.format(c=hex_color, ch=hex_color + "CC", cd=hex_color + "55"))
-    return btn
-
-
+# ─── BatchExecutionPanel ──────────────────────────────────────────────────────
 class BatchExecutionPanel(QFrame):
     """
-    Excel 批量 UID → 模版 1 发送面板
+    Excel 批量 UID → OTA payload 发送面板
     状态机: empty → imported → sending → sent_ok | sent_fail → done
+    get_payload_fn: callable() -> str | None  （返回已确认的 OTA payload）
     """
 
-    def __init__(self, mqtt_mgr: "MQTTManager", parent=None):
+    def __init__(self, mqtt_mgr: "MQTTManager",
+                 get_payload_fn,
+                 parent=None):
         super().__init__(parent)
-        self._mqtt       = mqtt_mgr
-        self._excel      = ExcelBatchManager()
-        self._idx        = 0
-        self._batch_active = False   # 区分批量发送与单次发送
+        self._mqtt         = mqtt_mgr
+        self._get_payload  = get_payload_fn
+        self._excel        = ExcelBatchManager()
+        self._idx          = 0
+        self._batch_active = False
 
         self._mqtt.sig_publish_ok.connect(self._on_publish_ok)
         self._mqtt.sig_publish_fail.connect(self._on_publish_fail)
@@ -324,9 +333,7 @@ class BatchExecutionPanel(QFrame):
         self._setup_ui()
         self._set_state("empty")
 
-    # ----------------------------------------------------------------
-    # UI 构建
-    # ----------------------------------------------------------------
+    # ── UI ────────────────────────────────────────────────────────────
     def _setup_ui(self):
         self.setObjectName("batchPanelFrame")
         self.setStyleSheet("""
@@ -338,15 +345,13 @@ class BatchExecutionPanel(QFrame):
         """)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 8, 12, 10)
-        outer.setSpacing(6)
+        outer.setSpacing(5)
 
-        # ── 标题行 ────────────────────────────────────────────────
+        # 标题行
         hdr = QHBoxLayout()
-        title_lbl = QLabel("📊  Excel 批量执行  —  模版 1 OTA 推送")
-        title_lbl.setStyleSheet(
-            "font-weight:bold; font-size:12px; color:#1A6B45;"
-        )
-        self._reimport_btn = self._small_btn("重新导入", "#5B9BD5")
+        title_lbl = QLabel("📊  Excel 批量 OTA 推送")
+        title_lbl.setStyleSheet("font-weight:bold; font-size:12px; color:#1A6B45;")
+        self._reimport_btn = _outline_btn("重新导入", "#5B9BD5")
         self._reimport_btn.clicked.connect(self._do_import)
         self._reimport_btn.hide()
         hdr.addWidget(title_lbl)
@@ -354,51 +359,42 @@ class BatchExecutionPanel(QFrame):
         hdr.addWidget(self._reimport_btn)
         outer.addLayout(hdr)
 
-        # ── 文件 + 进度行 ─────────────────────────────────────────
+        # 文件 + 进度行
         info_row = QHBoxLayout()
-        self._file_lbl     = QLabel("未导入文件")
-        self._file_lbl.setStyleSheet(
-            "font-size:11px; color:#8BAF9B; font-family:Consolas;"
-        )
+        self._file_lbl = QLabel("未导入文件")
+        self._file_lbl.setStyleSheet("font-size:11px; color:#8BAF9B; font-family:Consolas;")
         self._progress_lbl = QLabel("")
-        self._progress_lbl.setStyleSheet(
-            "font-size:11px; color:#5B9BD5; font-weight:bold;"
-        )
+        self._progress_lbl.setStyleSheet("font-size:11px; color:#5B9BD5; font-weight:bold;")
         info_row.addWidget(self._file_lbl)
         info_row.addStretch()
         info_row.addWidget(self._progress_lbl)
         outer.addLayout(info_row)
 
-        # ── 当前 UID + 状态行 ────────────────────────────────────
+        # 当前 UID + 状态行
         uid_row = QHBoxLayout()
         uid_prefix = QLabel("当前 UID:")
         uid_prefix.setStyleSheet("font-size:12px; color:#4A9970;")
         uid_prefix.setFixedWidth(65)
         self._cur_uid_lbl = QLabel("")
         self._cur_uid_lbl.setStyleSheet(
-            "font-size:13px; font-weight:bold; color:#1A6B45; font-family:Consolas;"
-        )
+            "font-size:13px; font-weight:bold; color:#1A6B45; font-family:Consolas;")
         self._status_lbl = QLabel("")
-        self._status_lbl.setStyleSheet(
-            "font-size:12px; color:#3EC78C; font-weight:bold;"
-        )
+        self._status_lbl.setStyleSheet("font-size:12px; color:#3EC78C; font-weight:bold;")
         uid_row.addWidget(uid_prefix)
         uid_row.addWidget(self._cur_uid_lbl, 1)
         uid_row.addWidget(self._status_lbl)
         outer.addLayout(uid_row)
 
-        # ── 操作按钮行 ───────────────────────────────────────────
+        # 操作按钮行
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        self._import_btn = _make_btn("📂  导入 Excel",  "#5B9BD5")
-        self._start_btn  = _make_btn("▶  开始执行",    "#3EC78C")
-        self._next_btn   = _make_btn("→  下一个",      "#3EC78C")
-        self._retry_btn  = _make_btn("↺  重试",        "#FFB347")
-        self._skip_btn   = _make_btn("⏭  跳过",        "#9E9E9E")
-        self._abort_btn  = _make_btn("■  终止",        "#FF6B6B")
-        self._reset_btn  = _make_btn("🔄  重置",        "#5B9BD5")
-
+        btn_row.setSpacing(7)
+        self._import_btn = _make_btn("📂  导入 Excel", "#5B9BD5")
+        self._start_btn  = _make_btn("▶  开始执行",   "#3EC78C")
+        self._next_btn   = _make_btn("→  下一个",     "#3EC78C")
+        self._retry_btn  = _make_btn("↺  重试",       "#FFB347")
+        self._skip_btn   = _make_btn("⏭  跳过",       "#9E9E9E")
+        self._abort_btn  = _make_btn("■  终止",       "#FF6B6B")
+        self._reset_btn  = _make_btn("🔄  重置",       "#5B9BD5")
         self._import_btn.clicked.connect(self._do_import)
         self._start_btn.clicked.connect(self._do_start)
         self._next_btn.clicked.connect(self._do_next)
@@ -406,17 +402,14 @@ class BatchExecutionPanel(QFrame):
         self._skip_btn.clicked.connect(self._do_skip)
         self._abort_btn.clicked.connect(self._do_abort)
         self._reset_btn.clicked.connect(self._do_reset)
-
         for b in (self._import_btn, self._start_btn, self._next_btn,
                   self._retry_btn, self._skip_btn, self._abort_btn, self._reset_btn):
             btn_row.addWidget(b)
         btn_row.addStretch()
         outer.addLayout(btn_row)
 
-    # ----------------------------------------------------------------
-    # 状态机
-    # ----------------------------------------------------------------
-    #               import reimport start next retry skip abort reset
+    # ── 状态机 ────────────────────────────────────────────────────────
+    #               import reimport start  next   retry  skip   abort  reset
     _STATE_VIS = {
         "empty":     (True,  False, False, False, False, False, False, False),
         "imported":  (False, True,  True,  False, False, False, False, False),
@@ -426,55 +419,32 @@ class BatchExecutionPanel(QFrame):
         "done":      (False, True,  False, False, False, False, False, True ),
     }
     _STATE_MSG = {
-        "empty":     ("",                        "#3EC78C"),
-        "imported":  ("就绪，点击开始执行",        "#3EC78C"),
-        "sending":   ("⏳ 发送中...",             "#FFB347"),
-        "sent_ok":   ("✅ 发送成功，单元格已标绿", "#3EC78C"),
+        "empty":     ("",                         "#3EC78C"),
+        "imported":  ("就绪，点击开始执行",          "#3EC78C"),
+        "sending":   ("⏳ 发送中...",              "#FFB347"),
+        "sent_ok":   ("✅ 发送成功，单元格已标绿",  "#3EC78C"),
         "sent_fail": ("❌ 发送失败",               "#FF6B6B"),
-        "done":      ("🎉 全部执行完毕！",          "#3EC78C"),
+        "done":      ("🎉 全部执行完毕！",           "#3EC78C"),
     }
 
     def _set_state(self, state: str):
-        btns = [
-            self._import_btn, self._reimport_btn, self._start_btn,
-            self._next_btn,   self._retry_btn,    self._skip_btn,
-            self._abort_btn,  self._reset_btn,
-        ]
+        btns = [self._import_btn, self._reimport_btn, self._start_btn,
+                self._next_btn, self._retry_btn, self._skip_btn,
+                self._abort_btn, self._reset_btn]
         for btn, vis in zip(btns, self._STATE_VIS.get(state, (False,) * 8)):
             btn.setVisible(vis)
         self._cur_uid_lbl.setVisible(state != "empty")
-        # uid 前缀也只在非 empty 时显示
         text, color = self._STATE_MSG.get(state, ("", "#3EC78C"))
         self._status_lbl.setText(text)
-        self._status_lbl.setStyleSheet(
-            f"font-size:12px; color:{color}; font-weight:bold;"
-        )
+        self._status_lbl.setStyleSheet(f"font-size:12px; color:{color}; font-weight:bold;")
 
     def _refresh_start_btn(self):
         self._start_btn.setEnabled(self._mqtt.is_connected())
 
-    @staticmethod
-    def _small_btn(text: str, color: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFixedHeight(24)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent; color: {color};
-                border: 1px solid {color}; border-radius: 5px;
-                padding: 1px 8px; font-size: 11px;
-            }}
-            QPushButton:hover {{ background-color: {color}22; }}
-        """)
-        return btn
-
-    # ----------------------------------------------------------------
-    # 事件处理
-    # ----------------------------------------------------------------
+    # ── 事件处理 ──────────────────────────────────────────────────────
     def _do_import(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 Excel 文件", "", "Excel 文件 (*.xlsx *.xls)"
-        )
+            self, "选择 Excel 文件", "", "Excel 文件 (*.xlsx *.xls)")
         if not path:
             return
         ok, msg = self._excel.import_file(path)
@@ -488,16 +458,16 @@ class BatchExecutionPanel(QFrame):
             self._refresh_start_btn()
         else:
             self._status_lbl.setText(f"❌ {msg}")
-            self._status_lbl.setStyleSheet(
-                "font-size:12px; color:#FF6B6B; font-weight:bold;"
-            )
+            self._status_lbl.setStyleSheet("font-size:12px; color:#FF6B6B; font-weight:bold;")
 
     def _do_start(self):
         if not self._mqtt.is_connected():
             self._status_lbl.setText("⚠️ 请先连接 MQTT 服务器")
-            self._status_lbl.setStyleSheet(
-                "font-size:12px; color:#FF6B6B; font-weight:bold;"
-            )
+            self._status_lbl.setStyleSheet("font-size:12px; color:#FF6B6B; font-weight:bold;")
+            return
+        if self._get_payload() is None:
+            self._status_lbl.setText("⚠️ 请先在上方填写参数并点击「确认 / 预览」")
+            self._status_lbl.setStyleSheet("font-size:12px; color:#FF6B6B; font-weight:bold;")
             return
         self._idx = 0
         self._send_current()
@@ -505,30 +475,28 @@ class BatchExecutionPanel(QFrame):
     def _send_current(self):
         if self._idx >= self._excel.count:
             self._set_state("done")
-            self._progress_lbl.setText(
-                f"{self._excel.count} / {self._excel.count}"
-            )
+            self._progress_lbl.setText(f"{self._excel.count} / {self._excel.count}")
+            return
+        payload = self._get_payload()
+        if payload is None:
+            self._status_lbl.setText("⚠️ OTA 参数已失效，请重新确认")
+            self._status_lbl.setStyleSheet("font-size:12px; color:#FF6B6B; font-weight:bold;")
             return
         uid   = self._excel.get_uid(self._idx)
         topic = f"/func/4/{uid}/get"
         self._cur_uid_lbl.setText(uid)
-        self._progress_lbl.setText(
-            f"{self._idx + 1} / {self._excel.count}"
-        )
+        self._progress_lbl.setText(f"{self._idx + 1} / {self._excel.count}")
         self._set_state("sending")
         self._batch_active = True
-        self._mqtt.publish(topic, TEMPLATE_1_PAYLOAD)
+        self._mqtt.publish(topic, payload)
 
     def _on_publish_ok(self):
         if not self._batch_active:
             return
         self._batch_active = False
         self._excel.mark_green(self._idx)
-        # 如果是最后一个，直接进入 done
         if self._idx >= self._excel.count - 1:
-            self._progress_lbl.setText(
-                f"{self._excel.count} / {self._excel.count}"
-            )
+            self._progress_lbl.setText(f"{self._excel.count} / {self._excel.count}")
             self._set_state("done")
         else:
             self._set_state("sent_ok")
@@ -550,25 +518,17 @@ class BatchExecutionPanel(QFrame):
         self._idx += 1
         if self._idx >= self._excel.count:
             self._set_state("done")
-            self._progress_lbl.setText(
-                f"{self._excel.count} / {self._excel.count}"
-            )
+            self._progress_lbl.setText(f"{self._excel.count} / {self._excel.count}")
         else:
-            uid = self._excel.get_uid(self._idx)
-            self._cur_uid_lbl.setText(uid)
-            self._progress_lbl.setText(
-                f"{self._idx + 1} / {self._excel.count}"
-            )
+            self._cur_uid_lbl.setText(self._excel.get_uid(self._idx))
+            self._progress_lbl.setText(f"{self._idx + 1} / {self._excel.count}")
             self._set_state("imported")
 
     def _do_abort(self):
         self._batch_active = False
-        uid = self._excel.get_uid(self._idx)
-        self._cur_uid_lbl.setText(uid)
+        self._cur_uid_lbl.setText(self._excel.get_uid(self._idx))
         self._status_lbl.setText("已终止执行")
-        self._status_lbl.setStyleSheet(
-            "font-size:12px; color:#9E9E9E; font-weight:bold;"
-        )
+        self._status_lbl.setStyleSheet("font-size:12px; color:#9E9E9E; font-weight:bold;")
         self._set_state("imported")
 
     def _do_reset(self):
@@ -582,9 +542,236 @@ class BatchExecutionPanel(QFrame):
         self._set_state("empty")
 
 
-# -------------------------------------------------------------------
-# MQTT 页面 Widget
-# -------------------------------------------------------------------
+# ─── CustomSendPanel ──────────────────────────────────────────────────────────
+class CustomSendPanel(QWidget):
+    """自定义消息发送面板"""
+
+    def __init__(self, mqtt_mgr: "MQTTManager", parent=None):
+        super().__init__(parent)
+        self._mqtt = mqtt_mgr
+        self._setup_ui()
+        self._mqtt.sig_connected.connect(lambda: self._send_btn.setEnabled(True))
+        self._mqtt.sig_disconnected.connect(lambda: self._send_btn.setEnabled(False))
+
+    def _setup_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 8, 0, 0)
+        outer.setSpacing(0)
+
+        grp = QGroupBox("📤  自定义消息")
+        grp_layout = QVBoxLayout(grp)
+        grp_layout.setSpacing(8)
+
+        topic_row = QHBoxLayout()
+        topic_lbl = QLabel("主题:")
+        topic_lbl.setFixedWidth(42)
+        self._topic_edit = QLineEdit()
+        self._topic_edit.setPlaceholderText("输入发布主题")
+        topic_row.addWidget(topic_lbl)
+        topic_row.addWidget(self._topic_edit)
+
+        self._msg_edit = QTextEdit()
+        self._msg_edit.setPlaceholderText("输入消息内容（支持 JSON）...")
+        self._msg_edit.setMaximumHeight(100)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._send_btn = _make_btn("⚡  发送", "#3EC78C", height=34)
+        self._send_btn.setEnabled(False)
+        self._send_btn.clicked.connect(self._do_send)
+        btn_row.addWidget(self._send_btn)
+
+        grp_layout.addLayout(topic_row)
+        grp_layout.addWidget(self._msg_edit)
+        grp_layout.addLayout(btn_row)
+
+        outer.addWidget(grp)
+        outer.addStretch()
+
+    def _do_send(self):
+        topic = self._topic_edit.text().strip()
+        msg   = self._msg_edit.toPlainText().strip()
+        if not topic:
+            self._mqtt.sig_log.emit(MQTTManager._fmt("[WARN]", "请输入发布主题", "orange"))
+            return
+        if not msg:
+            self._mqtt.sig_log.emit(MQTTManager._fmt("[WARN]", "消息内容不能为空", "orange"))
+            return
+        self._mqtt.publish(topic, msg)
+
+
+# ─── OTAPanel ─────────────────────────────────────────────────────────────────
+_JSON_STYLE_OK  = """QTextEdit {
+    background-color: #1C2E26; color: #A8E6C3;
+    font-family: Consolas, "Courier New", monospace; font-size: 11px;
+    border-radius: 6px; border: 1px solid #2A4A3A; padding: 4px; }"""
+_JSON_STYLE_ERR = """QTextEdit {
+    background-color: #2E1C1C; color: #F4AFAF;
+    font-family: Consolas, "Courier New", monospace; font-size: 11px;
+    border-radius: 6px; border: 1px solid #5A2A2A; padding: 4px; }"""
+
+
+class OTAPanel(QWidget):
+    """跨平台 OTA 升级面板：填参数 → 预览 JSON → 单设备发送 / Excel 批量"""
+
+    def __init__(self, mqtt_mgr: "MQTTManager", parent=None):
+        super().__init__(parent)
+        self._mqtt = mqtt_mgr
+        self._confirmed_payload: str | None = None
+        self._setup_ui()
+        self._mqtt.sig_connected.connect(self._refresh_send_btn)
+        self._mqtt.sig_disconnected.connect(self._refresh_send_btn)
+
+    def _setup_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 8, 0, 0)
+        outer.setSpacing(8)
+
+        # ── 参数输入区 ────────────────────────────────────────────
+        param_grp = QGroupBox("🔧  OTA 参数配置")
+        pg_layout = QVBoxLayout(param_grp)
+        pg_layout.setSpacing(6)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self._uid_edit  = QLineEdit()
+        self._uid_edit.setPlaceholderText("目标设备 UID（单设备发送时填写）")
+        self._url_edit  = QLineEdit()
+        self._url_edit.setPlaceholderText("http://...  固件下载地址")
+        self._ver_edit  = QLineEdit("1.1")
+        self._size_edit = QLineEdit()
+        self._size_edit.setPlaceholderText("固件字节数（整数），如 170000")
+        self._sha_edit  = QLineEdit()
+        self._sha_edit.setPlaceholderText("64 位十六进制 SHA256 校验值")
+
+        form.addRow("UID:",           self._uid_edit)
+        form.addRow("espfileUrl:",    self._url_edit)
+        form.addRow("espver:",        self._ver_edit)
+        form.addRow("espfilesize:",   self._size_edit)
+        form.addRow("espfilesha256:", self._sha_edit)
+
+        # 参数变动 → 清除已确认 payload（防止旧数据发送）
+        for edit in (self._url_edit, self._ver_edit, self._size_edit, self._sha_edit):
+            edit.textChanged.connect(self._invalidate_preview)
+
+        preview_row = QHBoxLayout()
+        preview_row.addStretch()
+        self._preview_btn = _make_btn("🔍  确认 / 预览 JSON", "#5B9BD5", height=32)
+        self._preview_btn.setMinimumWidth(170)
+        self._preview_btn.clicked.connect(self._do_preview)
+        preview_row.addWidget(self._preview_btn)
+
+        pg_layout.addLayout(form)
+        pg_layout.addLayout(preview_row)
+        outer.addWidget(param_grp)
+
+        # ── JSON 预览 + 发送区 ────────────────────────────────────
+        send_grp = QGroupBox("📋  发送预览")
+        sg_layout = QVBoxLayout(send_grp)
+        sg_layout.setContentsMargins(8, 6, 8, 8)
+        sg_layout.setSpacing(6)
+
+        self._topic_lbl = QLabel("发送主题: /func/4/{UID}/get")
+        self._topic_lbl.setStyleSheet(
+            "font-size: 11px; color: #5B9BD5; font-family: Consolas;")
+        self._uid_edit.textChanged.connect(self._update_topic_lbl)
+
+        self._json_preview = QTextEdit()
+        self._json_preview.setReadOnly(True)
+        self._json_preview.setMinimumHeight(100)
+        self._json_preview.setMaximumHeight(130)
+        self._json_preview.setPlaceholderText(
+            "填写上方参数后，点击「确认 / 预览 JSON」查看即将发送的内容...")
+        self._json_preview.setStyleSheet(_JSON_STYLE_OK)
+
+        send_btn_row = QHBoxLayout()
+        send_btn_row.addWidget(self._topic_lbl, 1)
+        self._send_single_btn = _make_btn("🚀  发送至单设备", "#3EC78C", height=32)
+        self._send_single_btn.setEnabled(False)
+        self._send_single_btn.clicked.connect(self._do_send_single)
+        send_btn_row.addWidget(self._send_single_btn)
+
+        sg_layout.addWidget(self._json_preview)
+        sg_layout.addLayout(send_btn_row)
+        outer.addWidget(send_grp)
+
+        # ── Excel 批量执行面板 ────────────────────────────────────
+        self._batch_panel = BatchExecutionPanel(
+            self._mqtt, self._get_payload, self)
+        outer.addWidget(self._batch_panel)
+
+    # ── 辅助 ──────────────────────────────────────────────────────────
+    def _update_topic_lbl(self, uid: str):
+        uid_part = uid.strip() if uid.strip() else "{UID}"
+        self._topic_lbl.setText(f"发送主题: /func/4/{uid_part}/get")
+
+    def _invalidate_preview(self):
+        if self._confirmed_payload is not None:
+            self._confirmed_payload = None
+            self._send_single_btn.setEnabled(False)
+            self._json_preview.setStyleSheet(_JSON_STYLE_OK)
+            self._json_preview.clear()
+
+    def _refresh_send_btn(self):
+        self._send_single_btn.setEnabled(
+            self._confirmed_payload is not None and self._mqtt.is_connected())
+
+    def _get_payload(self) -> str | None:
+        return self._confirmed_payload
+
+    # ── 事件处理 ──────────────────────────────────────────────────────
+    def _do_preview(self):
+        url    = self._url_edit.text().strip()
+        ver    = self._ver_edit.text().strip()
+        size_s = self._size_edit.text().strip()
+        sha    = self._sha_edit.text().strip()
+
+        errors = []
+        if not url:  errors.append("espfileUrl")
+        if not ver:  errors.append("espver")
+        if not sha:  errors.append("espfilesha256")
+
+        size = 0
+        if not size_s:
+            errors.append("espfilesize")
+        else:
+            try:
+                size = int(size_s)
+                if size <= 0:
+                    errors.append("espfilesize（需为正整数）")
+            except ValueError:
+                errors.append("espfilesize（需为整数）")
+
+        if errors:
+            self._json_preview.setStyleSheet(_JSON_STYLE_ERR)
+            self._json_preview.setPlainText(
+                "⚠️ 以下字段缺失或格式错误:\n  " + "\n  ".join(errors))
+            self._confirmed_payload = None
+            self._send_single_btn.setEnabled(False)
+            return
+
+        self._confirmed_payload = _build_ota_payload(url, ver, size, sha, pretty=False)
+        pretty_json             = _build_ota_payload(url, ver, size, sha, pretty=True)
+        self._json_preview.setStyleSheet(_JSON_STYLE_OK)
+        self._json_preview.setPlainText(pretty_json)
+        self._send_single_btn.setEnabled(self._mqtt.is_connected())
+
+    def _do_send_single(self):
+        if self._confirmed_payload is None:
+            return
+        uid = self._uid_edit.text().strip()
+        if not uid:
+            self._json_preview.setStyleSheet(_JSON_STYLE_ERR)
+            self._json_preview.setPlainText("⚠️ 请先填写 UID 字段（单设备发送专用）")
+            return
+        topic = f"/func/4/{uid}/get"
+        self._mqtt.publish(topic, self._confirmed_payload)
+
+
+# ─── MQTTWidget ───────────────────────────────────────────────────────────────
 class MQTTWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -594,18 +781,15 @@ class MQTTWidget(QWidget):
         self._mqtt.sig_disconnected.connect(self._on_disconnected)
         self._mqtt.sig_log.connect(self._append_log)
         self._connected = False
-        self._batch_panel: BatchExecutionPanel | None = None
         self._setup_ui()
 
-    # ----------------------------------------------------------------
-    # UI 构建
-    # ----------------------------------------------------------------
+    # ── UI ────────────────────────────────────────────────────────────
     def _setup_ui(self):
         main = QVBoxLayout(self)
         main.setContentsMargins(18, 10, 18, 14)
         main.setSpacing(10)
 
-        # ---- 标题行 ------------------------------------------------
+        # 标题行
         title_row = QHBoxLayout()
         icon_lbl = QLabel("📡")
         icon_lbl.setStyleSheet("font-size: 26px;")
@@ -616,12 +800,11 @@ class MQTTWidget(QWidget):
         title_row.addStretch()
         main.addLayout(title_row)
 
-        # ---- 连接配置 Group ----------------------------------------
+        # 连接配置
         conn_grp = QGroupBox("⚙️  连接配置")
         conn_layout = QHBoxLayout(conn_grp)
         conn_layout.setSpacing(14)
 
-        # 左列表单
         left_form = QFormLayout()
         left_form.setSpacing(6)
         left_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -637,7 +820,6 @@ class MQTTWidget(QWidget):
         left_form.addRow("端口:", self._port_spin)
         left_form.addRow("Client ID:", self._cid_edit)
 
-        # 右列表单
         right_form = QFormLayout()
         right_form.setSpacing(6)
         right_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -654,10 +836,8 @@ class MQTTWidget(QWidget):
         right_form.addRow("密码:", self._pass_edit)
         right_form.addRow("心跳(s):", self._ka_spin)
 
-        # 状态 + 按钮列
         ctrl_col = QVBoxLayout()
         ctrl_col.setSpacing(10)
-
         status_row = QHBoxLayout()
         self._dot_lbl = QLabel("⚫")
         self._dot_lbl.setStyleSheet("font-size: 16px;")
@@ -666,13 +846,11 @@ class MQTTWidget(QWidget):
         status_row.addWidget(self._dot_lbl)
         status_row.addWidget(self._status_lbl)
         status_row.addStretch()
-
         self._conn_btn = QPushButton("🔌  连接")
         self._conn_btn.setObjectName("primaryButton")
         self._conn_btn.setFixedWidth(110)
         self._conn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._conn_btn.clicked.connect(self._toggle_connection)
-
         ctrl_col.addLayout(status_row)
         ctrl_col.addWidget(self._conn_btn)
         ctrl_col.addStretch()
@@ -682,85 +860,42 @@ class MQTTWidget(QWidget):
         conn_layout.addLayout(ctrl_col, 3)
         main.addWidget(conn_grp)
 
-        # ---- 发送区 + 模版区（横向并排）-----------------------------
-        mid_row = QHBoxLayout()
-        mid_row.setSpacing(10)
+        # Tab 切换按钮
+        tab_bar = QHBoxLayout()
+        tab_bar.setSpacing(0)
+        self._tab_custom_btn = QPushButton("📤  自定义发送")
+        self._tab_ota_btn    = QPushButton("🛠️  跨平台 OTA")
+        for btn in (self._tab_custom_btn, self._tab_ota_btn):
+            btn.setFixedHeight(34)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tab_custom_btn.clicked.connect(lambda: self._switch_tab(0))
+        self._tab_ota_btn.clicked.connect(lambda: self._switch_tab(1))
+        tab_bar.addWidget(self._tab_custom_btn)
+        tab_bar.addWidget(self._tab_ota_btn)
+        tab_bar.addStretch()
+        main.addLayout(tab_bar)
 
-        # 自定义发送
-        send_grp = QGroupBox("📤  自定义发送")
-        send_layout = QVBoxLayout(send_grp)
-        send_layout.setSpacing(6)
+        # 堆叠内容区
+        self._stack = QStackedWidget()
 
-        topic_row = QHBoxLayout()
-        topic_lbl = QLabel("主题:")
-        topic_lbl.setFixedWidth(42)
-        self._topic_edit = QLineEdit()
-        self._topic_edit.setPlaceholderText("输入发布主题")
-        topic_row.addWidget(topic_lbl)
-        topic_row.addWidget(self._topic_edit)
+        # Page 0：自定义发送
+        self._custom_panel = CustomSendPanel(self._mqtt, self._stack)
+        self._stack.addWidget(self._custom_panel)
 
-        self._msg_edit = QTextEdit()
-        self._msg_edit.setPlaceholderText("输入消息内容（支持 JSON）...")
-        self._msg_edit.setMaximumHeight(70)
+        # Page 1：跨平台 OTA（带纵向滚动）
+        ota_scroll = QScrollArea()
+        ota_scroll.setWidgetResizable(True)
+        ota_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        ota_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        ota_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self._ota_panel = OTAPanel(self._mqtt, ota_scroll)
+        ota_scroll.setWidget(self._ota_panel)
+        self._stack.addWidget(ota_scroll)
 
-        self._send_btn = QPushButton("⚡  发送")
-        self._send_btn.setObjectName("sendButton")
-        self._send_btn.setEnabled(False)
-        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._send_btn.clicked.connect(self._send_custom)
+        main.addWidget(self._stack, 1)
+        self._switch_tab(0)
 
-        send_btn_row = QHBoxLayout()
-        send_btn_row.addStretch()
-        send_btn_row.addWidget(self._send_btn)
-
-        send_layout.addLayout(topic_row)
-        send_layout.addWidget(self._msg_edit)
-        send_layout.addLayout(send_btn_row)
-
-        # 模版区
-        tpl_grp = QGroupBox("📋  消息模板")
-        tpl_layout = QVBoxLayout(tpl_grp)
-        tpl_layout.setSpacing(8)
-
-        uid_row = QHBoxLayout()
-        uid_lbl = QLabel("设备 UID:")
-        uid_lbl.setFixedWidth(65)
-        self._uid_edit = QLineEdit()
-        self._uid_edit.setPlaceholderText("输入目标设备 UID")
-        uid_row.addWidget(uid_lbl)
-        uid_row.addWidget(self._uid_edit)
-
-        # 实时预览目标主题
-        self._tpl1_topic_lbl = QLabel("主题: /func/4/{UID}/get")
-        self._tpl1_topic_lbl.setStyleSheet(
-            "font-size: 11px; color: #5B9BD5; font-family: Consolas;"
-        )
-        self._uid_edit.textChanged.connect(self._update_tpl1_topic)
-
-        tpl1_desc = QLabel("模版 1：OTA 固件升级指令")
-        tpl1_desc.setStyleSheet("font-size: 11px; color: #8BAF9B;")
-
-        self._tpl1_btn = QPushButton("🚀  发送模版 1")
-        self._tpl1_btn.setObjectName("templateButton")
-        self._tpl1_btn.setEnabled(False)
-        self._tpl1_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._tpl1_btn.clicked.connect(self._send_template_1)
-
-        tpl_layout.addLayout(uid_row)
-        tpl_layout.addWidget(self._tpl1_topic_lbl)
-        tpl_layout.addWidget(tpl1_desc)
-        tpl_layout.addWidget(self._tpl1_btn)
-        tpl_layout.addStretch()
-
-        mid_row.addWidget(send_grp, 6)
-        mid_row.addWidget(tpl_grp, 4)
-        main.addLayout(mid_row)
-
-        # ---- 批量执行面板 — 常显，初始为 empty 状态 --------
-        self._batch_panel = BatchExecutionPanel(self._mqtt, self)
-        main.addWidget(self._batch_panel)
-
-        # ---- 日志区 ------------------------------------------------
+        # 日志区
         log_grp = QGroupBox("🖥️  消息日志")
         log_layout = QVBoxLayout(log_grp)
         log_layout.setContentsMargins(6, 4, 6, 6)
@@ -772,12 +907,9 @@ class MQTTWidget(QWidget):
         clr_btn.setFixedWidth(58)
         clr_btn.setStyleSheet("""
             QPushButton {
-                background: #274035;
-                color: #5EF09E;
-                border: 1px solid #3A6050;
-                border-radius: 5px;
-                padding: 2px 6px;
-                font-size: 11px;
+                background: #274035; color: #5EF09E;
+                border: 1px solid #3A6050; border-radius: 5px;
+                padding: 2px 6px; font-size: 11px;
             }
             QPushButton:hover { background: #3A5045; }
         """)
@@ -787,22 +919,33 @@ class MQTTWidget(QWidget):
         self._log_edit = QTextEdit()
         self._log_edit.setObjectName("logTextEdit")
         self._log_edit.setReadOnly(True)
-        self._log_edit.setMinimumHeight(110)
+        self._log_edit.setMinimumHeight(100)
         self._log_edit.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         log_layout.addLayout(log_header)
         log_layout.addWidget(self._log_edit)
-        main.addWidget(log_grp, 1)
+        main.addWidget(log_grp)
 
-    # ----------------------------------------------------------------
-    # 事件处理
-    # ----------------------------------------------------------------
-    def _update_tpl1_topic(self, uid: str):
-        uid_part = uid if uid else "{UID}"
-        self._tpl1_topic_lbl.setText(f"主题: /func/4/{uid_part}/get")
+    # ── Tab 切换 ──────────────────────────────────────────────────────
+    _TAB_ACTIVE = """QPushButton {
+        background-color: #3EC78C; color: white; border: none;
+        border-radius: 8px 8px 0 0; font-size: 13px; font-weight: bold;
+        padding: 6px 22px; border-bottom: 3px solid #24A56B; }"""
+    _TAB_INACTIVE = """QPushButton {
+        background-color: #E8F5EE; color: #5A9B75;
+        border: 1px solid #C8DDD4; border-bottom: none;
+        border-radius: 8px 8px 0 0; font-size: 13px; font-weight: bold;
+        padding: 6px 22px; }
+    QPushButton:hover { background-color: #D4EDE0; }"""
 
+    def _switch_tab(self, idx: int):
+        self._stack.setCurrentIndex(idx)
+        self._tab_custom_btn.setStyleSheet(
+            self._TAB_ACTIVE if idx == 0 else self._TAB_INACTIVE)
+        self._tab_ota_btn.setStyleSheet(
+            self._TAB_ACTIVE if idx == 1 else self._TAB_INACTIVE)
+
+    # ── 连接控制 ──────────────────────────────────────────────────────
     def _toggle_connection(self):
         if self._connected:
             self._mqtt.disconnect_broker()
@@ -836,8 +979,6 @@ class MQTTWidget(QWidget):
             }
             QPushButton:hover { background-color: #E85555; }
         """)
-        self._send_btn.setEnabled(True)
-        self._tpl1_btn.setEnabled(True)
 
     def _on_disconnected(self):
         self._connected = False
@@ -846,27 +987,6 @@ class MQTTWidget(QWidget):
         self._conn_btn.setText("🔌  连接")
         self._conn_btn.setEnabled(True)
         self._conn_btn.setStyleSheet("")
-        self._send_btn.setEnabled(False)
-        self._tpl1_btn.setEnabled(False)
-
-    def _send_custom(self):
-        topic = self._topic_edit.text().strip()
-        msg = self._msg_edit.toPlainText().strip()
-        if not topic:
-            self._append_log(MQTTManager._fmt("[WARN]", "请输入发布主题", "orange"))
-            return
-        if not msg:
-            self._append_log(MQTTManager._fmt("[WARN]", "消息内容不能为空", "orange"))
-            return
-        self._mqtt.publish(topic, msg)
-
-    def _send_template_1(self):
-        uid = self._uid_edit.text().strip()
-        if not uid:
-            self._append_log(MQTTManager._fmt("[WARN]", "请输入设备 UID", "orange"))
-            return
-        topic = f"/func/4/{uid}/get"
-        self._mqtt.publish(topic, TEMPLATE_1_PAYLOAD)
 
     def _append_log(self, html_line: str):
         self._log_edit.append(html_line)
@@ -875,3 +995,4 @@ class MQTTWidget(QWidget):
 
     def _clear_log(self):
         self._log_edit.clear()
+
